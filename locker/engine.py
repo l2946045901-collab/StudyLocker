@@ -81,6 +81,7 @@ class Enforcer:
             self._family_dir = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._enforcing = False                       # run()/run_hero() 期间为真（WMI 门控用）
         self._entries: list[tuple[str, bool]] = []    # (归一化路径, 是目录)
         self._started_at: float = 0.0                 # 会话开始时刻（epoch 秒）
         self._recent_kill: dict[int, float] = {}      # 去重：pid -> 最近拦截时刻
@@ -183,6 +184,12 @@ class Enforcer:
 
     def _recent(self, pid: int, window: float = 2.5) -> bool:
         now = time.time()
+        # 顺带清掉过旧条目，避免 72 小时长会话里字典无限膨胀
+        if len(self._recent_kill) > 4096:
+            self._recent_kill = {p: t for p, t in self._recent_kill.items()
+                                 if now - t < window}
+            self._recent_denied = {k: t for k, t in self._recent_denied.items()
+                                   if now - t < 30}
         if pid in self._recent_kill and now - self._recent_kill[pid] < window:
             return True
         self._recent_kill[pid] = now
@@ -303,7 +310,7 @@ class Enforcer:
                 pid = int(event.ProcessID)
             except Exception:
                 continue
-            if not self.session_active():
+            if not self._enforcing:
                 continue
             try:
                 exe = psutil.Process(pid).exe()
@@ -317,10 +324,6 @@ class Enforcer:
                 self._kill(pid, exe, name, "block_new", "非赦免应用")
 
     # ---------- 主循环 ----------
-
-    def session_active(self) -> bool:
-        s = load_session()
-        return bool(s.get("active"))
 
     def run(self) -> int:
         session = load_session()
@@ -342,6 +345,7 @@ class Enforcer:
         wmi_thread = threading.Thread(target=self._wmi_worker, name="wmi", daemon=True)
         if not os.environ.get("SL_NO_WMI"):  # 诊断用：跳过 WMI 实时通道，仅轮询
             wmi_thread.start()
+        self._enforcing = True
 
         outcome = "interrupted"
         try:
@@ -365,17 +369,22 @@ class Enforcer:
                 self._stop.wait(1.0)
         finally:
             self._stop.set()
+            self._enforcing = False
             if wmi_thread.is_alive():
                 wmi_thread.join(timeout=3.0)
             self._cleanup(outcome)
         return 0
 
     def run_hero(self, dev: bool = False) -> int:
-        """勇士之路：无视一切解锁信号，重启续锁，直到截止时刻自动解除。
+        """勇士之路：无视一切解锁信号，重启续锁，直到剩余时间耗尽自动解除。
 
-        只相信两件事：内存里的截止时刻 + hero.json（缺失时自愈重写）。
-        会话文件、force_stop、界面按钮、删除 hero.json 均无法解锁。
-        最终保险丝：即使设定时长跨天，最迟次日 06:00（cap_at）自动解除。
+        计时以“剩余秒数”为准，而不是绝对墙钟截止时刻：
+          - 运行中用 time.monotonic() 计量——篡改系统时钟（拨快/拨慢）无效；
+          - 每秒把剩余秒数回写 hero.json（remaining 检查点），重启/被杀后
+            从检查点续时——“拨快时钟再重启”也无效；
+          - 只相信内存里的剩余秒数 + hero.json（被删/被改每循环全量还原）；
+            会话文件、force_stop、界面按钮均无法解锁。
+          - 最终保险丝：按开启时刻的 cap_at（次日 06:00）换算的总剩余秒数封顶。
         """
         from locker.config import (load_hero, save_hero,
                                    register_hero_autostart, unregister_hero_autostart)
@@ -395,10 +404,20 @@ class Enforcer:
         except (TypeError, ValueError):
             cap_at = None
         deadline = min(deadline, cap_at) if cap_at else deadline   # 保险丝取早者
-        if time.time() >= deadline:
-            # 开机时已过期：直接清理收尾
+        try:
+            cp_remaining = float(hero["remaining"])
+        except (KeyError, TypeError, ValueError):
+            cp_remaining = None
+        if cp_remaining is not None and cp_remaining >= 0:
+            # 运行中引擎写入的检查点优先于墙钟推算（免疫改时钟后重启）
+            remaining = cp_remaining
+        else:
+            remaining = deadline - time.time()
+        if remaining <= 0:
+            # 开机时已到期：直接清理收尾
             log_event("hero_expired_at_boot", reason="已过截止/保险丝时刻")
             hero["active"] = False
+            hero["remaining"] = 0
             save_hero(hero)
             if not dev:
                 unregister_hero_autostart()
@@ -408,14 +427,20 @@ class Enforcer:
         self._started_at = started
         self.refresh({"exempted": hero.get("exempted", [])})   # 冻结名单
         hero["engine_pid"] = os.getpid()
+        hero["remaining"] = round(remaining, 1)
         save_hero(hero)
         log_event("hero_start", pid=os.getpid(),
                   duration_min=hero.get("duration_min"),
-                  deadline=round(deadline, 1))
+                  deadline=round(deadline, 1),
+                  remaining=round(remaining, 1))
+
+        mono_end = time.monotonic() + remaining
+        next_heal = 0.0
 
         wmi_thread = threading.Thread(target=self._wmi_worker, name="wmi", daemon=True)
         if not os.environ.get("SL_NO_WMI"):
             wmi_thread.start()
+        self._enforcing = True
 
         if not dev:
             # 注册登录自启（重启续锁）+ 拉起守护进程（引擎被杀自动复活）
@@ -426,22 +451,30 @@ class Enforcer:
             self.scan_and_enforce(log_type="close_existing", sweep_all=True)
 
         try:
-            while time.time() < deadline:
-                h = load_hero()
-                if not h.get("active"):
-                    # hero.json 被删/被改：锁定不受影响，重新落盘自愈
+            while True:
+                now_mono = time.monotonic()
+                if now_mono >= mono_end:
+                    break
+                now = time.time()
+                if now >= next_heal:
+                    # 每秒自愈一次：内存中的状态全量落盘——文件被删除、active 被
+                    # 置假、deadline/remaining 被篡改，都会在约 1 秒内被还原。
+                    next_heal = now + 1.0
+                    hero["active"] = True
                     hero["engine_pid"] = os.getpid()
+                    hero["remaining"] = round(mono_end - now_mono, 1)
                     save_hero(hero)
                 self.scan_and_enforce()
                 self._stop.wait(1.0)
         finally:
             self._stop.set()
+            self._enforcing = False
             if wmi_thread.is_alive():
                 wmi_thread.join(timeout=3.0)
-        # 截止时刻到：自动解除并清理全部自启动项
-        is_fuse = bool(cap_at) and time.time() >= cap_at and hero.get("deadline") and float(hero["deadline"]) > cap_at
-        log_event("hero_finished", reason="次日保险丝(06:00)自动解除" if is_fuse else "倒计时结束")
+        # 剩余时间耗尽：自动解除并清理全部自启动项
+        log_event("hero_finished", reason="倒计时结束")
         hero["active"] = False
+        hero["remaining"] = 0
         save_hero(hero)
         s = load_session()
         if s.get("active"):

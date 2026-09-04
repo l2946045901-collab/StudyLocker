@@ -56,10 +56,18 @@ def main() -> None:
     except (OSError, ValueError):
         hero = {}
     active = bool(hero.get("active"))
+    # 到期判断优先用运行中引擎写入的剩余秒数检查点（免疫“改时钟再重启”）
     try:
-        expired = time.time() >= float(hero.get("deadline", 0))
+        remaining = float(hero.get("remaining"))
     except (TypeError, ValueError):
-        expired = True
+        remaining = None
+    if remaining is not None and remaining >= 0:
+        expired = remaining <= 0
+    else:
+        try:
+            expired = time.time() >= float(hero.get("deadline", 0))
+        except (TypeError, ValueError):
+            expired = True
     if active and not expired:
         subprocess.Popen(_engine_cmd() + ["--hero"],
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

@@ -280,14 +280,14 @@ class HeroDialog(QDialog):
         return f"我确认开启勇士之路 {self.spin.value()} 分钟"
 
     def _sync_target(self, *_):
-        from locker.config import hero_cap_at
+        from locker.config import hero_fuse_seconds
         minutes = self.spin.value()
         h, m = divmod(minutes, 60)
         dur_txt = f"{h} 小时" + (f" {m} 分钟" if m else "")
-        # 保险丝截断提示
-        cap = hero_cap_at()
-        if time.time() + minutes * 60 > cap:
-            extra = f"\n注：设定超过次日 06:00，将按最终保险在次日 06:00 解除（实际约 {max(1, int((cap - time.time()) / 60))} 分钟）"
+        # 保险丝截断提示（保险丝 = 到次日 06:00 的剩余秒数）
+        fuse = hero_fuse_seconds()
+        if minutes * 60 > fuse:
+            extra = f"\n注：设定超过次日 06:00，将按最终保险在次日 06:00 解除（实际约 {max(1, fuse // 60)} 分钟）"
         else:
             extra = ""
         self.lbl_dur.setText(f"即将锁定：{dur_txt}（{minutes} 分钟），期间无法以任何方式提前解除。{extra}")
@@ -829,21 +829,33 @@ class MainWindow(QMainWindow):
         force_ts = s.get("force_stop_at")
         remaining = end_at - now
 
-        # 勇士之路状态（独立于普通会话：引擎只认 hero.json 的截止时刻）
+        # 勇士之路状态（独立于普通会话：引擎以“剩余秒数”计时——运行中走
+        # monotonic、重启走落盘检查点，篡改系统时钟不影响引擎判定；界面
+        # 显示用墙钟估算，无检查点时退回 deadline）
         hero = C.load_hero()
         try:
-            hero_deadline = float(hero.get("deadline", 0))
+            hero_remaining = float(hero.get("remaining"))
         except (TypeError, ValueError):
-            hero_deadline = 0.0
-        hero_cap = hero.get("cap_at")
+            hero_remaining = None
+        if hero_remaining is None or hero_remaining < 0:
+            try:
+                hero_deadline = float(hero.get("deadline", 0))
+            except (TypeError, ValueError):
+                hero_deadline = 0.0
+            hero_cap = hero.get("cap_at")
+            try:
+                hero_cap = float(hero_cap) if hero_cap else None
+            except (TypeError, ValueError):
+                hero_cap = None
+            if hero_cap:
+                hero_deadline = min(hero_deadline, hero_cap)   # 保险丝取早者
+            hero_remaining = max(0.0, hero_deadline - now)
         try:
-            hero_cap = float(hero_cap) if hero_cap else None
+            fuse_hit = bool(hero.get("cap_at")) and bool(hero.get("deadline")) \
+                and float(hero["deadline"]) > float(hero["cap_at"])
         except (TypeError, ValueError):
-            hero_cap = None
-        if hero_cap:
-            hero_deadline = min(hero_deadline, hero_cap)   # 保险丝取早者
-        hero_active = bool(hero.get("active")) and now < hero_deadline
-        fuse_hit = bool(hero_cap) and float(hero.get("deadline", 0)) > hero_cap
+            fuse_hit = False
+        hero_active = bool(hero.get("active")) and hero_remaining > 0
         enforcing = active or hero_active
 
         # --- 状态机外围的异常/过渡处理 ---
@@ -932,7 +944,7 @@ class MainWindow(QMainWindow):
         self._update_tray_icon()
         if hero_active:
             self._banner("勇士之路进行中 · 无法提前解除", COLOR_HERO)
-            remain_h = max(0.0, hero_deadline - now)
+            remain_h = max(0.0, hero_remaining)
             fuse_str = (" · 最终保险：次日早 6:00 必解" if fuse_hit
                         else " · 到期自动解除")
             hero_eng_pid = hero.get("engine_pid")

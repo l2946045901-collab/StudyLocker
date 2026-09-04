@@ -43,17 +43,23 @@ def load_hero() -> dict:
 
 
 def main() -> None:
-    last_engine_pid = None
     while True:
         hero = load_hero()
-        active = bool(hero.get("active"))
-        try:
-            deadline = float(hero.get("deadline", 0))
-        except (TypeError, ValueError):
-            deadline = 0.0
-        if not active:
+        if not hero.get("active"):
             break                                # 引擎已自行收尾
-        if time.time() >= deadline:
+        # 到期判断优先用运行中引擎写入的剩余秒数检查点（免疫“改时钟再重启”）
+        try:
+            remaining = float(hero.get("remaining"))
+        except (TypeError, ValueError):
+            remaining = None
+        if remaining is not None:
+            expired = remaining <= 0
+        else:
+            try:
+                expired = time.time() >= float(hero.get("deadline", 0))
+            except (TypeError, ValueError):
+                expired = True
+        if expired:
             # 已到点但引擎不在 → 拉起引擎让它完成清理（它启动后立即收尾退出）
             if not _engine_alive(hero.get("engine_pid")):
                 _spawn_engine()
@@ -67,14 +73,21 @@ def main() -> None:
 
 
 def _engine_alive(pid) -> bool:
+    """PID 存在且确是引擎进程（防 PID 复用被误判为“引擎还活着”）。"""
     if not pid:
         return False
     try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
         import psutil
-        return psutil.pid_exists(int(pid))
+        cl = " ".join(psutil.Process(pid).cmdline() or []).casefold()
+        return "engine_entry.py" in cl or cl.rstrip().endswith("engine.exe")
     except Exception:
+        # psutil 不可用时退回纯存活探测
         try:
-            os.kill(int(pid), 0)
+            os.kill(pid, 0)
             return True
         except Exception:
             return False

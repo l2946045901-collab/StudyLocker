@@ -255,6 +255,11 @@ def hero_cap_at() -> float:
                       6, 0, 0, 0, 0, -1))
 
 
+def hero_fuse_seconds() -> int:
+    """保险丝折算成剩余秒数：从现在到次日 06:00（锁定时长的最终上限）。"""
+    return max(60, int(hero_cap_at() - time.time()))
+
+
 # ---------- 打包(冻结)与源码双模式路径抽象 ----------
 
 _ENTRY_SCRIPTS = {
